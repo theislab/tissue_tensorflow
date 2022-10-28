@@ -1,0 +1,14 @@
+anndata
+docutils
+jinja2
+numpy>=1.14.0
+matplotlib
+pandas
+scanpy
+scipy
+scikit-learn
+seaborn
+sphinx
+sphinx-autodoc-typehints
+sphinx_rtd_theme
+tensorflow>=2.4.1
