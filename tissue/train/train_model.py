@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 from typing import Union
 
-from tissue.estimators import EstimatorGCN, EstimatorGAT, EstimatorMultiInstance, EstimatorREG, EstimatorGsum, EstimatorMultiInstanceDispersion, EstimatorREGDispersion
+from tissue.estimators import EstimatorGCN, EstimatorGAT, EstimatorMultiInstance, EstimatorREG, EstimatorGsum, EstimatorREGDispersion
 
 
 def _try_save(fn, obj):
