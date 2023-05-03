@@ -201,7 +201,7 @@ class InterpreterBase:
         import matplotlib.lines as mlines
         handles = [mlines.Line2D([], [], linestyle='None', color=scalarMap.to_rgba(k), label=ctype, marker='o') for
                    k, ctype in enumerate(np.unique(cell_types))]
-        lgd = fig.legend(handles=handles, loc='center left', bbox_to_anchor=(1, 0.5), title='cell type')
+        fig.legend(handles=handles, loc='center left', bbox_to_anchor=(1, 0.5), title='cell type')
 
         # Save, show and return figure.
         plt.tight_layout()
@@ -254,13 +254,11 @@ class InterpreterBase:
             label='Group',
             partitions=['train', 'test'],
             embedding_method='umap',
-            palette="colorblind",
             save: Union[str, None] = None,
             suffix: str = "_umap_graphs.pdf",
             show: bool = True,
             return_axs: bool = False,
             data_key=None,
-            hue_order=None,
             return_embeddings=None,
     ):
         """
@@ -309,7 +307,7 @@ class InterpreterBase:
         hue = np.argmax(labels, axis=1)
         hue = [np.round(float(label_names[i]),0) for i in hue]        
 
-        if data_key=='bz':
+        if data_key == 'bz':
             palette = {
                             1: sns.color_palette("colorblind")[0], 
                             2: sns.color_palette("colorblind")[1], 
@@ -372,7 +370,7 @@ class InterpreterBase:
 
         handles, labels = ax.get_legend_handles_labels()
         handles = list(np.array(handles)[[l in label_names for l in labels]])
-        labels = list(np.array(labels)[[[l in label_names for l in labels]]])
+        labels = list(np.array(labels)[[l in label_names for l in labels]])
         fig.legend(handles=list(handles), labels=list(labels), title=label, loc='center left', bbox_to_anchor=(1, 0.5))
 
         # Save, show and return figure.
@@ -480,7 +478,6 @@ class InterpreterBase:
             show: bool = True,
             return_axs: bool = False,
             data_key=None,
-            hue_order=None,
             return_embeddings=False,
             n_neighbors=15,
             tumor_given=False,
@@ -741,6 +738,8 @@ class InterpreterBase:
 
         for x_batch, y_batch in ds:
             h = x_batch[0]
+            if np.sum(np.abs(h)) == 0:
+                continue
             node_idx = np.arange(0, np.max(np.where(np.sum(np.abs(h), axis=0) > 0)[0]) + 1)  # excluded padded cells
             with tf.GradientTape(persistent=True) as g:
                 activations = self.model.get_layer(layer).output
@@ -765,117 +764,237 @@ class InterpreterBase:
         grads = np.mean(np.array(grads), axis=0)
         return grads
 
+    def _get_identity_dataset(
+            self,
+            batch_size,
+            shuffle_buffer_size,
+            train: bool = True,
+            seed: Union[int, None] = None
+    ):
+        """
+        Copy of the _get_dataset() method modified to provide one sample containing all cell types.
+
+        :param batch_size:
+        :param shuffle_buffer_size:
+        :param seed: Seed to set for np.random for node downsampling.
+        :return: A tf.data.Dataset for supervised models.
+        """
+
+        def generator():
+            for key in [self.img_keys_test[0]]:
+                h = self.h[key]
+                diff_tmp = self.max_nodes - h.shape[0]
+
+                h = np.identity(self.n_features)
+                diff = self.max_nodes - h.shape[0]
+                padding_zeros_h = np.zeros((diff, h.shape[1]))
+                h = np.asarray(np.concatenate((h, padding_zeros_h)), dtype="float32")
+
+                a = self.a[key]
+                coo = a.tocoo()
+                a_ind = np.asarray(np.mat([coo.row, coo.col]).transpose(), dtype="int64")
+                a_val = np.asarray(coo.data, dtype="float32")
+                a_shape = np.asarray((self.max_nodes, self.max_nodes), dtype="int64")
+                a = tf.SparseTensor(indices=a_ind, values=a_val, dense_shape=a_shape)
+
+                c = np.asarray(self.graph_covariates[key], dtype="float32")
+
+                cluster = self.cluster_assignments[key]
+                padding_zeros = np.zeros((diff_tmp, cluster.shape[1]))
+                cluster = np.asarray(np.concatenate((cluster, padding_zeros)))
+
+                y = [np.asarray(self.y[key][x], dtype="float32") for x in self.graph_label_selection]
+                if self.self_supervision:
+                    for label in reversed(self.self_supervision_label):
+                        y = [self.y[key][label]] + y
+                if self.node_supervision:
+                    y_node_label = np.asarray(self.y[key]["node_labels"], dtype="float32")
+                    padding_zeros_label = np.zeros((diff, y_node_label.shape[1]))
+                    y_node_label = np.asarray(np.concatenate((y_node_label, padding_zeros_label)), dtype="float32")
+                    y = [y_node_label] + y
+                y = tuple(y)
+
+                yield (h, a, c, cluster), y
+
+        output_signatures_y = [tf.TensorSpec(shape=(None,), dtype=tf.float32)] * len(self.graph_label_selection)
+        if self.self_supervision:
+            for label in reversed(self.self_supervision_label):
+                if label == 'relative_cell_types':
+                    output_signatures_y = [
+                                              tf.TensorSpec(shape=(self.n_cluster, self.n_types), dtype=tf.float32)
+                                          ] + output_signatures_y
+        if self.node_supervision:
+            output_signatures_y = [
+                                      tf.TensorSpec(shape=(self.max_nodes, self.n_types), dtype=tf.float32)
+                                  ] + output_signatures_y
+        output_signatures_y = tuple(output_signatures_y)
+
+        dataset = tf.data.Dataset.from_generator(
+            generator=generator,
+            output_signature=(
+                (
+                    tf.TensorSpec(shape=(self.max_nodes, self.n_features), dtype=tf.float32),  # node features (h)
+                    tf.SparseTensorSpec(shape=None, dtype=tf.float32),  # adjacency matrix (a)
+                    tf.TensorSpec(shape=(self.n_graph_covariates,), dtype=tf.float32),  # graph covariates (c)
+                    tf.TensorSpec(shape=(self.max_nodes, self.n_cluster), dtype=tf.float32)  # clusters (cluster)
+                ),
+                output_signatures_y  # labels (y)
+            )
+        )
+        if train:
+            dataset = dataset.shuffle(
+                buffer_size=shuffle_buffer_size,
+                seed=seed,
+                reshuffle_each_iteration=True
+            )
+            dataset = dataset.repeat()
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(5)
+        return dataset
+
+    def _get_cell_type_embeddings(
+            self,
+            layer,
+    ) -> list:
+        """
+        Computes the cell type representations after the initial feature embedding layers.
+
+        :param layers: Layers for which to return embeddings.
+        :return:
+        """
+        ds = self._get_identity_dataset(
+            batch_size=1,
+            shuffle_buffer_size=1,
+            train=False,
+            seed=1234
+        )
+        model = tf.keras.Model(self.model.input, self.model.get_layer(layer).output)
+        for step, (x_batch, y_batch) in enumerate(ds):
+            h = x_batch[0]
+            h = h.numpy().squeeze()
+            # Mask node embedding:
+            node_idx = np.arange(0, np.max(np.where(np.sum(np.abs(h), axis=1) > 0)[0]) + 1)  # excluded padded cells
+            activations = model(x_batch).numpy().squeeze()
+            if activations.shape[0] == h.shape[0]:
+                activations = activations[node_idx, :]
+        return activations
+
     def plot_weight_matrix(
             self,
             layer_name,
-            signed=True,
-            is_type_space=True,
-            data_key: str = "bz",
+            cell_type_embedding_layer_name,
             target_label='grade',
             save: Union[str, None] = None,
             suffix: str = "_weight_matrix.pdf",
             panel_width: float = 4.,
             panel_height: float = 4.,
             show: bool = True,
-            return_axs: bool = False,
     ):
         """
-        Plots the weight matrix of a model trained on cell types.
+        Plots filter weights of the first GCN layer in relation to cell types
+        together with the effect each filter has on the class prediction task.
+
+        Model architecture this is meant for:
+            - input: one-hot encoded cell types as node features
+            - some node feature embedding layers 'assigning' one embedding vector to each cell type
+            - one or more GCN layers
+            - optionally any additional model elements...
+
+        Assuming this model architecture, the first GCN layer becomes:
+        A x H x E x W
+        with:
+        - the adjacency matrix A (#cells x #cells)
+        - the one hot encoded cell type input matrix H (#cells x #cell_types)
+        - the cell type embedding vectors E (#cell_types x emb_dim)
+        - the weight matrix of the GCN layer W (emb_dim x #filters).
+
+        By looking at E x W (#cell types x #filters) we can see what cell types and cell type combinations a filter
+        is sensitive to. Additionally, we can check which effect a filter has on the final classification, by computing
+        gradients from the model output wrt to the filter activations.
+
         :param layer_name: The layer from which the weight is taken.
         :param signed: Whether to show the raw or absolute values of this matrix.
-        :param bz: If True, the cell types are nicely sorted. Only for BZ!
         :param save: Whether (if not None) and where (path as string given as save) to save plot.
         :param suffix: Suffix of file name to save to.
         :param show: Whether to display plot.
-        :param return_axs: Whether to return axis objects.
         :return:
         """
         import matplotlib.pyplot as plt
         from mpl_toolkits.axes_grid1 import make_axes_locatable
         import matplotlib.cm as cm
 
-        if not return_axs:
-            plt.ioff()
-
-        fig = plt.figure(figsize=(panel_width, panel_height))
-        ax1 = fig.add_subplot(111)
+        # get filter/weight matrix W (emb_dim x #filters)
 
         weights = self.model.get_layer(layer_name).get_weights()[0]
         if len(weights) == 1:
             weights = weights[0]
-        if not signed:
-            weights = np.abs(weights)
-        self.test = weights
+
+        # get cell type embedding vectors E (#cell_types x emb_dim)
+
+        cell_type_embeddings = self._get_cell_type_embeddings(
+            layer=cell_type_embedding_layer_name,
+        )
+
+        # compute E x W
+
+        weights = cell_type_embeddings @ weights
+
+        # get gradients for these filters (#classes x #filters)
+
         gradients = self._compute_gradients_filters(
             layer=layer_name,
             image_key=self.img_keys_test,
             target_label=target_label
         )
-        # group filters into the grades that they are most important for and sort them within
-        # that group
+
+        # group filters into the grades that they are most important for and sort them within that group by strength
+
         grade = np.argmax(gradients, axis=0)
         new_order = []
         for gr in np.unique(grade):
             filter = (grade != gr) * 10
             grad = gradients[gr] + filter
-            indices = np.argsort(grad)[:np.sum(grade == gr)][::-1]# reversed filter order before [:np.sum(grade == gr)]
-            
+            indices = np.argsort(grad)[:np.sum(grade == gr)][::-1]
             new_order += list(indices)
         weights = weights[:, new_order]
         gradients = gradients[:, new_order]
-        if is_type_space:
-            cluster_key = self.data.img_celldata[self.img_keys_test[0]].uns['metadata']['cluster_col_preprocessed']
-            self.data.celldata.obs[cluster_key]=self.data.celldata.obs[cluster_key].astype(str)
 
-            cell_types = np.unique(self.data.celldata.obs[cluster_key])
+        # plot
 
-            new_order = np.arange(0, len(cell_types))
-            weights = weights[new_order]
-            yticks = cell_types[new_order]
-            ylabel = "cell types"
-        else:
-            yticks = self.data.node_feature_names
-            ylabel = "features"
+        plt.ioff()
 
-        min_weight = np.min(weights)
-        max_weight = np.max(weights)
-        abs_weight = np.max([np.abs(min_weight), np.abs(max_weight)])
-        im_pos = ax1.matshow(weights, cmap=cm.get_cmap('seismic'), vmin=-abs_weight, vmax=abs_weight)
+        fig, (ax_grads, ax_weights) = plt.subplots(2, 1, figsize=(panel_width, panel_height))
 
-        divider = make_axes_locatable(ax1)
-        ax2 = divider.append_axes("top", size='100%', pad=1.0)
-        cax_pos = divider.append_axes("right", size='2%', pad=1.0)
-        fig.colorbar(im_pos, ax=ax1, cax=cax_pos)
-        ax1.set_ylabel(ylabel)
-        ax1.set_yticks(ticks=np.arange(0, len(yticks), 1))
-        ax1.set_yticklabels(yticks)
-        ax1.set_xticks([], [])
-        ax1.axis('image')
+        cell_types = list(self.data.img_celldata[self.img_keys_test[0]].uns['node_type_names'].values())
 
-        min_weight = np.min(gradients)
-        max_weight = np.max(gradients)
-        abs_weight = np.max([np.abs(min_weight), np.abs(max_weight)])
-        im2 = ax2.matshow(gradients, cmap=cm.get_cmap('seismic'), vmin=-abs_weight, vmax=abs_weight)
-        
+        abs_weight = np.max(np.abs(weights))
+        im_pos = ax_weights.matshow(weights, cmap=cm.get_cmap('seismic'), vmin=-abs_weight, vmax=abs_weight)
+        ax_weights.set_ylabel('cell types')
+        ax_weights.set_yticks(ticks=np.arange(0, len(cell_types), 1))
+        ax_weights.set_yticklabels(cell_types)
+        ax_weights.set_xticks([], [])
+        ax_weights.axis('image')
+        ax_weights.grid(False)
+
+        divider = make_axes_locatable(ax_weights)
+        cax_weights = divider.append_axes("right", size='2%', pad=1.0)
+        fig.colorbar(im_pos, cax=cax_weights)
+
+        abs_weight = np.max(np.abs(gradients))
+        im2 = ax_grads.matshow(gradients, cmap=cm.get_cmap('seismic'), vmin=-abs_weight, vmax=abs_weight)
         n_filter = gradients.shape[1]
-        ax2.set_xticks(np.arange(n_filter))
-        ax2.set_xticklabels(np.arange(1, n_filter + 1))
-        ax2.set_xlabel('filter')
-        ax2.xaxis.set_label_position('top')
-        ax2.axis('image')
-        if target_label == "grade":
-            ax2.set_yticklabels(['', 'grade 1', 'grade 2', 'grade 3'])
-        elif target_label == "Group":
-            ax2.set_yticklabels(['', 'Group 1', 'Group 2'])
-        else:
-            ax2.set_yticklabels(
-                [''] +
-                [x.split(target_label + ">")[-1] for x in list(self.data.label_names[target_label])]
-            )
-        ax1.grid(False)
-        ax2.grid(False)
-        cax3 = divider.append_axes("right", size='2%', pad=1.0)
-        cbar = fig.colorbar(im2, ax=ax2, cax=cax3)
+        ax_grads.set_xticks(np.arange(n_filter))
+        ax_grads.set_xticklabels(np.arange(1, n_filter + 1))
+        ax_grads.set_xlabel('filter')
+        ax_grads.xaxis.set_label_position('top')
+        ax_grads.axis('image')
+
+        class_labels = self.data.img_celldata[self.img_keys_test[0]].uns['graph_covariates']['label_names'][target_label]
+        ax_grads.set_yticklabels([''] + list(class_labels))
+        ax_grads.grid(False)
+        divider = make_axes_locatable(ax_grads)
+        cax_grads = divider.append_axes("right", size='2%', pad=1.0)
+        cbar = fig.colorbar(im2, cax=cax_grads)
 
         # Save, show and return figure.
         plt.tight_layout()
@@ -890,12 +1009,10 @@ class InterpreterBase:
         if show:
             plt.grid(False)
             plt.show()
-        if return_axs:
-            return ax
-        else:
-            plt.close(fig)
-            plt.ion()
-            return None
+        plt.close(fig)
+        plt.ion()
+        return None
+
 
 class InterpreterGraph(InterpreterBase, estimators.EstimatorGraph):
     pass
